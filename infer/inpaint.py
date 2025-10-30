@@ -7,6 +7,7 @@ from typing import Literal
 import json
 import numpy as np
 import pandas as pd
+import math
 import torch
 from torchvision import transforms
 from diffusers import (
@@ -18,14 +19,93 @@ from diffusers import (
     FluxFillPipeline
 )
 import cv2
-from openai import OpenAI
+#from openai import OpenAI
 from diffusers.utils import export_to_video, load_image, load_video
 from PIL import Image
 from io import BytesIO
 import base64
 
 
-vlm_model = OpenAI()
+#vlm_model = OpenAI()
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+import re
+
+def _normalize_for_compare(s: str) -> str:
+    
+    return re.sub(r"(?:\s|##|\u2581)+", "", s).lower()
+
+def find_token_indices_for_phrase(tokenizer, text: str, phrase: str):
+    enc_full = tokenizer(
+        text,
+        add_special_tokens=True,
+        padding=False,
+        truncation=False,
+        return_tensors=None,
+    )
+    ids = enc_full["input_ids"]
+
+    phrase_norm = _normalize_for_compare(phrase)
+
+    try:
+        special_mask = tokenizer.get_special_tokens_mask(ids, already_has_special_tokens=True)
+    except Exception:
+        special_mask = [0] * len(ids)
+
+    hits = set()
+    has_convert = hasattr(tokenizer, "convert_ids_to_tokens")
+    if has_convert:
+        try:
+            pieces = tokenizer.convert_ids_to_tokens(ids, skip_special_tokens=False)
+        except Exception:
+            has_convert = False
+
+    if has_convert:
+        N = len(ids)
+        for i in range(N):
+            if special_mask[i] == 1:
+                continue
+            acc = ""
+            span = []
+            j = i
+            while j < N and special_mask[j] == 0:
+                acc += pieces[j]
+                span.append(j)
+                acc_norm = _normalize_for_compare(acc)
+                if acc_norm == phrase_norm:
+                    hits.update(span)
+                    break
+                if len(acc_norm) > len(phrase_norm):
+                    break
+                j += 1
+        if hits:
+            return sorted(hits)
+
+    enc_phrase = tokenizer(
+        phrase,
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    )
+    needle = enc_phrase["input_ids"]
+
+    if len(needle) == 0 or len(ids) < len(needle):
+        return []
+
+    N, L = len(ids), len(needle)
+    for i in range(N - L + 1):
+        if all(special_mask[i+k] == 0 for k in range(L)) and ids[i:i+L] == needle:
+            hits.update(range(i, i + L))
+
+    return sorted(hits)
+
+
+
+
+
+
 
 def _visualize_video(pipe, mask_background, original_video, video, masks):
     
@@ -116,82 +196,82 @@ def read_video_with_mask(video_path, masks, mask_id, skip_frames_start=0, skip_f
     video = [item.convert("RGB") for item in video]
     return video, masked_video, binary_masks, fps
 
-def video_editing_prompt(prompt, llm_model, masked_image=None, target_img_caption=True):
-    '''
-    Generate image inpainting prompt based on masked image or video description
-    Args:
-        prompt: original video description
-        llm_model: LLM model name
-        masked_image: PIL Image with masked region
-        target_img_caption: whether to use masked image for caption generation
-    Returns:
-        prompt: original video description
-        image_inpainting_prompt: static description for inpainting
-    '''
-    if prompt is None:
-        raise ValueError("prompt is None")
-        
-    vlm_model = OpenAI()
-    
-    if target_img_caption:
-        if masked_image is None:
-            raise ValueError("masked_image is None when target_img_caption=True")
-            
-        # Convert PIL image to base64
-        import base64
-        from io import BytesIO
-        buffered = BytesIO()
-        masked_image.save(buffered, format="PNG")
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-        
-        system_prompt = "You are an expert in image description. Based on the given masked image, please generate a concise description for target for following inpainting."
-        
-        user_prompt = f"""Please generate a description for the unmasked target in the given masked image. Requirements:
-        1. Keep the description concise and precise
-        2. Only describe unmasked visual elements
-        3. Black background is not a visual element
-        Only return the description, no other words."""
-
-        # Call OpenAI vision API with image
-        response = vlm_model.chat.completions.create(
-            model=llm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{img_str}"
-                            }
-                        }
-                    ]
-                }
-            ]
-        )
-    else:
-        # Original text-only prompt processing
-        system_prompt = "You are an expert in image description. Based on the given video description, please generate a concise description for the first static frame, focusing on the most important visual elements."
-        
-        user_prompt = f"""Video description: {prompt}
-        Please generate a static description for the first frame. Requirements:
-        1. Keep the description concise and precise
-        2. Only describe key visual elements
-        3. Avoid using any dynamic or temporal-related words
-        Only return the description, no other words."""
-        
-        response = vlm_model.chat.completions.create(
-            model=llm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ]
-        )
-
-    image_inpainting_prompt = response.choices[0].message.content
-    return prompt, image_inpainting_prompt
+# def video_editing_prompt(prompt, llm_model, masked_image=None, target_img_caption=True):
+#     '''
+#     Generate image inpainting prompt based on masked image or video description
+#     Args:
+#         prompt: original video description
+#         llm_model: LLM model name
+#         masked_image: PIL Image with masked region
+#         target_img_caption: whether to use masked image for caption generation
+#     Returns:
+#         prompt: original video description
+#         image_inpainting_prompt: static description for inpainting
+#     '''
+#     if prompt is None:
+#         raise ValueError("prompt is None")
+#
+#     vlm_model = OpenAI()
+#
+#     if target_img_caption:
+#         if masked_image is None:
+#             raise ValueError("masked_image is None when target_img_caption=True")
+#
+#         # Convert PIL image to base64
+#         import base64
+#         from io import BytesIO
+#         buffered = BytesIO()
+#         masked_image.save(buffered, format="PNG")
+#         img_str = base64.b64encode(buffered.getvalue()).decode()
+#
+#         system_prompt = "You are an expert in image description. Based on the given masked image, please generate a concise description for target for following inpainting."
+#
+#         user_prompt = f"""Please generate a description for the unmasked target in the given masked image. Requirements:
+#         1. Keep the description concise and precise
+#         2. Only describe unmasked visual elements
+#         3. Black background is not a visual element
+#         Only return the description, no other words."""
+#
+#         # Call OpenAI vision API with image
+#         response = vlm_model.chat.completions.create(
+#             model=llm_model,
+#             messages=[
+#                 {"role": "system", "content": system_prompt},
+#                 {
+#                     "role": "user",
+#                     "content": [
+#                         {"type": "text", "text": user_prompt},
+#                         {
+#                             "type": "image_url",
+#                             "image_url": {
+#                                 "url": f"data:image/png;base64,{img_str}"
+#                             }
+#                         }
+#                     ]
+#                 }
+#             ]
+#         )
+#     else:
+#         # Original text-only prompt processing
+#         system_prompt = "You are an expert in image description. Based on the given video description, please generate a concise description for the first static frame, focusing on the most important visual elements."
+#
+#         user_prompt = f"""Video description: {prompt}
+#         Please generate a static description for the first frame. Requirements:
+#         1. Keep the description concise and precise
+#         2. Only describe key visual elements
+#         3. Avoid using any dynamic or temporal-related words
+#         Only return the description, no other words."""
+#
+#         response = vlm_model.chat.completions.create(
+#             model=llm_model,
+#             messages=[
+#                 {"role": "system", "content": system_prompt},
+#                 {"role": "user", "content": user_prompt}
+#             ]
+#         )
+#
+#     image_inpainting_prompt = response.choices[0].message.content
+#     return prompt, image_inpainting_prompt
 
 def generate_video(
     prompt: str,
@@ -238,7 +318,7 @@ def generate_video(
     - guidance_scale (float): The scale for classifier-free guidance. Higher values can lead to better alignment with the prompt.
     - num_videos_per_prompt (int): Number of videos to generate per prompt.
     - dtype (torch.dtype): The data type for computation (default is torch.bfloat16).
-    - generate_type (str): The type of video generation (e.g., 't2v', 'i2v', 'v2v').·
+    - generate_type (str): The type of video generation (e.g., 't2v', 'i2v', 'v2v').
     - seed (int): The seed for reproducibility.
     # inpainting
     - inpainting_mask_meta (str): The path of the inpainting mask meta data.
@@ -253,6 +333,9 @@ def generate_video(
     - down_sample_fps (int): The down sample fps.
     """
 
+    
+
+
     image = None
     video = None
 
@@ -262,9 +345,12 @@ def generate_video(
         if ".0.mp4" in meta_data['path']:
             video_path = os.path.join(image_or_video_path, video_base_name[:-3], f'{video_base_name}.0.mp4')
             mask_frames_path = os.path.join("../data/video_inpainting/videovo", video_base_name, "all_masks.npz")
+            density_path = os.path.join("../data/video_inpainting/videovo", video_base_name, "density.npz")
         elif ".mp4" in meta_data['path']:
-            video_path = os.path.join(image_or_video_path.replace("videovo", "pexels/pexels"), video_base_name[:9], f'{video_base_name}.mp4')
+            video_path = os.path.join(image_or_video_path.replace("videovo", "pexels/pexels"), video_base_name[:9],
+                                      f'{video_base_name}.mp4')
             mask_frames_path = os.path.join("../data/video_inpainting/pexels", video_base_name, "all_masks.npz")
+            density_path = os.path.join("../data/video_inpainting/pexels", video_base_name, "density.npz")
         else:
             raise NotImplementedError
         fps = meta_data['fps']
@@ -272,7 +358,8 @@ def generate_video(
         start_frame = meta_data['start_frame']
         end_frame = meta_data['end_frame']
         all_masks = np.load(mask_frames_path)["arr_0"]
-        prompt = meta_data['caption']
+        prompt = meta_data['caption1']
+        image_inpainting_prompt=meta_data['caption2']
         
         
         print("-"*100)
@@ -299,7 +386,14 @@ def generate_video(
                     torch_dtype=dtype,
                     id_pool_resample_learnable=True,
                 ).to(dtype=dtype).cuda()
+                
+                
+                
 
+                
+                
+                
+                
                 pipe = CogVideoXI2VDualInpaintAnyLPipeline.from_pretrained(
                     model_path,
                     branch=branch,
@@ -364,7 +458,9 @@ def generate_video(
             masked_image = Image.fromarray(masked_image.astype(np.uint8))
 
 
-            prompt, image_inpainting_prompt = video_editing_prompt(prompt, llm_model, masked_image=masked_image)
+            #prompt, image_inpainting_prompt = video_editing_prompt(prompt, llm_model, masked_image=masked_image)
+
+
             print("-"*100)
             print(f"prompt: {prompt}")
             print("-"*100)
@@ -432,6 +528,131 @@ def generate_video(
             else:
                 binary_masks[0] = Image.fromarray(np.zeros_like(np.array(binary_masks[0]))).convert("RGB")
         image = masked_video[0]
+
+
+
+
+        text_input = pipe.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=pipe.tokenizer.model_max_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        with torch.no_grad():
+            text_embeddings = pipe.text_encoder(text_input.input_ids.to(pipe.device))[0]
+        text_seq_length = text_embeddings.shape[1]
+        print("=" * 100)
+        print(f"text_seq_length=={text_seq_length}")
+        print("=" * 100)
+
+        focus_word = "smoke"
+        focus_ids = find_token_indices_for_phrase(pipe.tokenizer, prompt, focus_word)
+        print(f'focus word "{focus_word}" token indices (in [0, text_seq_length-1]): {focus_ids}')
+
+        ids = pipe.tokenizer(prompt, return_tensors="pt", padding="max_length",
+                             max_length=pipe.tokenizer.model_max_length).input_ids[0]
+        tokens = [pipe.tokenizer.decode([tid]) for tid in ids.tolist()]
+        print("TOKENS:", list(enumerate(tokens[:64])))
+        print("focus_ids =", focus_ids)
+
+        # ---- Load & slice ----
+        # ---- Load & slice ----
+        Dnp = np.load(density_path)
+        if "density" in Dnp:
+            Dnp = Dnp["density"]
+        elif "arr_0" in Dnp:
+            Dnp = Dnp["arr_0"]
+        else:
+            Dnp = Dnp[list(Dnp.keys())[0]]
+
+        D = torch.from_numpy(Dnp).float()  # [F_raw,H,W]
+        D = D[start_frame:end_frame]  # [F_vis,H,W]
+        D = torch.clamp(D, min=0)
+
+        nz_pix = D[D > 0]
+        if nz_pix.numel() > 0:
+            min_pos = nz_pix.min().item()
+            eps_floor = max(min_pos * 0.5, 1e-8)
+            D = torch.where(D >= eps_floor, D, torch.zeros_like(D))
+
+        D = D.to(pipe.device)
+
+        cfg = pipe.transformer.config
+        ps = int(cfg.patch_size)
+        Hs, Ws = int(cfg.sample_height), int(cfg.sample_width)
+        tcr = int(getattr(cfg, "temporal_compression_ratio", 4))
+        Ts = int(cfg.sample_frames)
+        K = int((Ts - 1) // tcr + 1)
+
+        D_KHW = torch.nn.functional.interpolate(
+            D.unsqueeze(0).unsqueeze(0), size=(K, D.shape[1], D.shape[2]), mode="nearest"
+        )[0, 0]
+
+        D_KHsWs = torch.nn.functional.interpolate(
+            D_KHW[:, None, :, :], size=(Hs, Ws), mode="bilinear", align_corners=False,
+            antialias=True if "antialias" in torch.nn.functional.interpolate.__code__.co_varnames else False
+        )[:, 0]
+
+        nz_sp = D_KHsWs[D_KHsWs > 0]
+        if nz_sp.numel() > 0:
+            floor_sp = max(nz_sp.min().item() * 0.5, 1e-8)
+            D_KHsWs = torch.where(D_KHsWs >= floor_sp, D_KHsWs, torch.zeros_like(D_KHsWs))
+
+        D_tok = torch.nn.functional.avg_pool2d(D_KHsWs, kernel_size=ps, stride=ps)
+
+        nz_tok = D_tok[D_tok > 0]
+        if nz_tok.numel() > 0:
+            floor_tok = max(nz_tok.min().item() * 0.5, 1e-8)
+            D_tok = torch.where(D_tok >= floor_tok, D_tok, torch.zeros_like(D_tok))
+
+        alpha_raw = D_tok.flatten().unsqueeze(0).contiguous()
+
+        nz_raw = alpha_raw[alpha_raw > 0]
+        if nz_raw.numel() > 16:
+            lo, hi = torch.quantile(nz_raw, 0.05), torch.quantile(nz_raw, 0.95)
+            alpha = torch.clamp((alpha_raw - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+        else:
+            alpha = alpha_raw / (alpha_raw.max() + 1e-6)
+
+        center_c_val = 0.5
+
+        if nz_raw.numel() > 0:
+            editable = (alpha_raw > 0).float()
+        else:
+            editable = torch.zeros_like(alpha_raw)
+
+        if guidance_scale is not None and guidance_scale > 1.0:
+            edit_uncond_frac = 0.10
+            alpha = torch.cat([edit_uncond_frac * alpha, alpha], dim=0)
+            editable = torch.cat([editable, editable], dim=0)
+
+        attention_kwargs = {
+            "focus_text_token_indices": focus_ids,
+            "density_alpha_video": alpha,
+            "editable_mask_video": editable,
+            "kappa": 1.6,
+            "beta_s": 0.0,
+            "strength": 3.2,
+            "center_c": 0.5,
+            "gamma": 3.2,
+            "do_density_edit": True,
+        }
+
+        L = getattr(pipe.transformer.config, "num_layers", None)
+        if L is None:
+            L = 30
+        lo = int(L * 0.25)
+        hi = int(L * 0.95)
+        edit_layers = list(range(lo, hi, 1))
+        if hasattr(pipe.transformer, "set_attn_edit_layers"):
+            pipe.transformer.set_attn_edit_layers(edit_layers)
+        else:
+            pipe.transformer._attn_edit_layers = set(edit_layers)
+
+        print(f"[AttnEdit] enable on layers: {edit_layers}")
+
         inpaint_outputs = pipe(
             prompt=prompt,
             image=image,
@@ -449,8 +670,28 @@ def generate_video(
             stride= int(frames - overlap_frames),
             prev_clip_weight=prev_clip_weight,
             id_pool_resample_learnable=True if id_adapter_resample_learnable_path is not None else False,
-            output_type="np"
+            output_type="np",
+            attention_kwargs = attention_kwargs
         ).frames[0]
+
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
         video_generate = inpaint_outputs
         binary_masks[0] = gt_mask_first_frame
         video[0] = gt_video_first_frame
