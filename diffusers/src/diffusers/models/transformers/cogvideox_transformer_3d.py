@@ -366,6 +366,15 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         self.gradient_checkpointing = False
 
+        self._attn_edit_layers = None  # type: Optional[set]
+
+    def set_attn_edit_layers(self, layers):
+
+        if layers is None:
+            self._attn_edit_layers = None
+        else:
+            self._attn_edit_layers = set(int(i) for i in layers)
+
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
 
@@ -503,7 +512,16 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 )
 
         batch_size, num_frames, channels, height, width = hidden_states.shape
-
+        ps = int(self.config.patch_size)  
+        self._last_token_grid = {
+            "F": int(num_frames),  
+            "H_latent": int(height),  
+            "W_latent": int(width), 
+            "patch_size": ps,
+            "H_tokens": int(height) // ps,  
+            "W_tokens": int(width) // ps,  
+            "tokens_per_frame": (int(height) // ps) * (int(width) // ps),
+        }
         # 1. Time embedding
         timesteps = timestep
         t_emb = self.time_proj(timesteps)
@@ -550,6 +568,33 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # 3. Transformer blocks
         hidden_states_list = []
         for i, block in enumerate(self.transformer_blocks):
+            # -------- 统一构造 base_kwargs / use_edit / current_block_kwargs --------
+            base_kwargs = {}
+            if attention_kwargs and "prev_hidden_states" in attention_kwargs:
+                layer_states = attention_kwargs["prev_hidden_states"].get(i)
+                if layer_states is not None:
+                    base_kwargs["prev_hidden_states"] = layer_states
+                    base_kwargs["prev_clip_weight"] = attention_kwargs["prev_clip_weight"]
+            if attention_kwargs and ("prev_resample_mask" in attention_kwargs):
+                prev_resample_mask = attention_kwargs.get("prev_resample_mask")
+                if prev_resample_mask is not None:
+                    base_kwargs["prev_resample_mask"] = prev_resample_mask
+
+            # 是否在此层启用“密度编辑”的参数透传
+            use_edit = (getattr(self, "_attn_edit_layers", None) is None) or (i in self._attn_edit_layers)
+            if use_edit and attention_kwargs:
+                current_block_kwargs = base_kwargs.copy()
+                for k, v in attention_kwargs.items():
+                    if k not in {"prev_hidden_states", "prev_clip_weight", "prev_resample_mask"}:
+                        current_block_kwargs[k] = v
+            else:
+                current_block_kwargs = base_kwargs
+
+
+            current_block_kwargs["attn_layer_index"] = i
+            current_block_kwargs["attn_num_layers"] = len(self.transformer_blocks)
+
+            # -------- 两条分支都使用 current_block_kwargs --------
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module):
@@ -567,20 +612,10 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     image_rotary_emb,
                     attention_mask,
                     resample_mask,
-                    attention_kwargs,
+                    current_block_kwargs,  # ← 这里原来是 attention_kwargs，改成 current_block_kwargs
                     **ckpt_kwargs,
                 )
             else:
-                current_block_kwargs = attention_kwargs.copy() if attention_kwargs else {}
-                if attention_kwargs and "prev_hidden_states" in attention_kwargs:
-                    layer_states = attention_kwargs["prev_hidden_states"].get(i)
-                    if layer_states is not None:
-                        current_block_kwargs["prev_hidden_states"] = layer_states
-                        current_block_kwargs["prev_clip_weight"] = attention_kwargs["prev_clip_weight"]
-                    prev_resample_mask = attention_kwargs.get("prev_resample_mask")
-                    if prev_resample_mask is not None:
-                        current_block_kwargs["prev_resample_mask"] = prev_resample_mask
-            
                 hidden_states, encoder_hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
@@ -588,8 +623,9 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     image_rotary_emb=image_rotary_emb,
                     attention_mask=attention_mask,
                     resample_mask=resample_mask,
-                    attention_kwargs=current_block_kwargs,
+                    attention_kwargs=current_block_kwargs,  # ← 已带 attn_layer_index/attn_num_layers
                 )
+
             if self_guidance_hidden_states is not None:
                 hidden_states = torch.where(masks == False, self_guidance_hidden_states[i], hidden_states)
 
