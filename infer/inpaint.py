@@ -567,17 +567,9 @@ def generate_video(
         else:
             Dnp = Dnp[list(Dnp.keys())[0]]
 
-        D = torch.from_numpy(Dnp).float()  # [F_raw,H,W]
-        D = D[start_frame:end_frame]  # [F_vis,H,W]
-        D = torch.clamp(D, min=0)
-
-        nz_pix = D[D > 0]
-        if nz_pix.numel() > 0:
-            min_pos = nz_pix.min().item()
-            eps_floor = max(min_pos * 0.5, 1e-8)
-            D = torch.where(D >= eps_floor, D, torch.zeros_like(D))
-
-        D = D.to(pipe.device)
+        D = torch.from_numpy(Dnp).float()
+        D = D[start_frame:end_frame]
+        D = torch.clamp(D, min=0).to(pipe.device)
 
         cfg = pipe.transformer.config
         ps = int(cfg.patch_size)
@@ -595,56 +587,40 @@ def generate_video(
             antialias=True if "antialias" in torch.nn.functional.interpolate.__code__.co_varnames else False
         )[:, 0]
 
-        nz_sp = D_KHsWs[D_KHsWs > 0]
-        if nz_sp.numel() > 0:
-            floor_sp = max(nz_sp.min().item() * 0.5, 1e-8)
-            D_KHsWs = torch.where(D_KHsWs >= floor_sp, D_KHsWs, torch.zeros_like(D_KHsWs))
-
         D_tok = torch.nn.functional.avg_pool2d(D_KHsWs, kernel_size=ps, stride=ps)
-
-        nz_tok = D_tok[D_tok > 0]
-        if nz_tok.numel() > 0:
-            floor_tok = max(nz_tok.min().item() * 0.5, 1e-8)
-            D_tok = torch.where(D_tok >= floor_tok, D_tok, torch.zeros_like(D_tok))
-
         alpha_raw = D_tok.flatten().unsqueeze(0).contiguous()
 
-        nz_raw = alpha_raw[alpha_raw > 0]
-        if nz_raw.numel() > 16:
-            lo, hi = torch.quantile(nz_raw, 0.05), torch.quantile(nz_raw, 0.95)
-            alpha = torch.clamp((alpha_raw - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+        nz = alpha_raw[alpha_raw > 0]
+        if nz.numel() > 16:
+            q10 = torch.quantile(nz, 0.10)
+            q50 = torch.quantile(nz, 0.50)
+            q90 = torch.quantile(nz, 0.90)
+            span = torch.clamp(q90 - q10, min=1e-4)
+            alpha01 = torch.clamp((alpha_raw - q10) / (span + 1e-6), 0.0, 1.0)
+            alpha = alpha01
+            center_c_val = float(q50.item())
         else:
-            alpha = alpha_raw / (alpha_raw.max() + 1e-6)
+            vmax = alpha_raw.max()
+            alpha = alpha_raw / (vmax + 1e-6) if float(vmax) > 1e-8 else torch.zeros_like(alpha_raw)
+            center_c_val = 0.5
 
-        center_c_val = 0.5
-
-        if nz_raw.numel() > 0:
-            editable = (alpha_raw > 0).float()
-        else:
-            editable = torch.zeros_like(alpha_raw)
-
-        if guidance_scale is not None and guidance_scale > 1.0:
-            edit_uncond_frac = 0.10
-            alpha = torch.cat([edit_uncond_frac * alpha, alpha], dim=0)
-            editable = torch.cat([editable, editable], dim=0)
+        editable = (alpha_raw > 0).float() if nz.numel() > 0 else torch.zeros_like(alpha_raw)
 
         attention_kwargs = {
             "focus_text_token_indices": focus_ids,
             "density_alpha_video": alpha,
             "editable_mask_video": editable,
-            "kappa": 1.6,
-            "beta_s": 0.0,
-            "strength": 3.2,
-            "center_c": 0.5,
-            "gamma": 3.2,
+            "kappa": 2.0,
+            "beta_s": 0.10,
+            "strength": 3.8,
+            "center_c": center_c_val,
+            "gamma": 1.9,
             "do_density_edit": True,
         }
 
-        L = getattr(pipe.transformer.config, "num_layers", None)
-        if L is None:
-            L = 30
-        lo = int(L * 0.25)
-        hi = int(L * 0.95)
+        L = getattr(pipe.transformer.config, "num_layers", None) or 30
+        lo = int(L * 0.60)
+        hi = int(L * 0.92)
         edit_layers = list(range(lo, hi, 1))
         if hasattr(pipe.transformer, "set_attn_edit_layers"):
             pipe.transformer.set_attn_edit_layers(edit_layers)
@@ -652,6 +628,10 @@ def generate_video(
             pipe.transformer._attn_edit_layers = set(edit_layers)
 
         print(f"[AttnEdit] enable on layers: {edit_layers}")
+        print(f"[AttnEdit] alpha>0 ratio = {(alpha_raw > 0).float().mean().item():.3f}, "
+              f"q10/50/90 = {float(nz.quantile(0.10).item()) if nz.numel() > 0 else 0:.3f}/"
+              f"{float(nz.quantile(0.50).item()) if nz.numel() > 0 else 0:.3f}/"
+              f"{float(nz.quantile(0.90).item()) if nz.numel() > 0 else 0:.3f}")
 
         inpaint_outputs = pipe(
             prompt=prompt,
