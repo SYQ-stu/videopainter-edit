@@ -2218,8 +2218,7 @@ class CogVideoXAttnProcessor2_0:
 
 class CogVideoXAttnProcessor2_0_resample:
     r"""
-    Processor for implementing scaled dot-product attention for the CogVideoX model. It applies a rotary embedding on
-    query and key vectors, but does not include spatial normalization.
+    Processor for implementing scaled dot-product attention for the CogVideoX model.
     """
 
     def __init__(self):
@@ -2251,14 +2250,15 @@ class CogVideoXAttnProcessor2_0_resample:
         **kwargs,
     ) -> torch.Tensor:
 
+        import math
+
         device = hidden_states.device
-        dtype  = hidden_states.dtype
+        dtype = hidden_states.dtype
 
         if focus_text_token_indices is not None:
-            if not torch.is_tensor(focus_text_token_indices):
-                focus_ids = torch.as_tensor(focus_text_token_indices, dtype=torch.long, device=device)
-            else:
-                focus_ids = focus_text_token_indices.to(device=device, dtype=torch.long)
+            focus_ids = (torch.as_tensor(focus_text_token_indices, dtype=torch.long, device=device)
+                         if not torch.is_tensor(focus_text_token_indices)
+                         else focus_text_token_indices.to(device=device, dtype=torch.long))
         else:
             focus_ids = None
 
@@ -2274,19 +2274,16 @@ class CogVideoXAttnProcessor2_0_resample:
                 raise TypeError("editable_mask_video must be a Tensor")
             editable_mask = editable_mask_video.to(device=device, dtype=torch.float32)
 
-        kappa    = 0.7  if kappa    is None else float(kappa)
-        beta_s   = 0.3  if beta_s   is None else float(beta_s)
-        strength = 2.0  if strength is None else float(strength)
-        center_c = 0.5  if center_c is None else float(center_c)
-        gamma    = 2.0  if gamma    is None else float(gamma)
+        kappa = 0.7 if kappa is None else float(kappa)
+        beta_s = 0.3 if beta_s is None else float(beta_s)
+        strength = 2.0 if strength is None else float(strength)
+        center_c = 0.5 if center_c is None else float(center_c)
+        gamma = 2.0 if gamma is None else float(gamma)
         do_density_edit = False if do_density_edit is None else bool(do_density_edit)
 
-        beta_s   = max(0.0, min(1.0, beta_s))
+        beta_s = max(0.0, min(1.0, beta_s))
         center_c = max(0.0, min(1.0, center_c))
-        gamma    = max(0.1, float(gamma))
-
-        print(f"[AttnEdit] kappa={kappa:.3f}, beta_s={beta_s:.3f}, strength={strength:.3f}, center_c={center_c:.3f}, gamma={gamma:.3f}, focus_ids = {focus_ids}")
-
+        gamma = max(0.1, float(gamma))
 
         text_seq_length = encoder_hidden_states.size(1)
         hidden_cat = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -2295,56 +2292,71 @@ class CogVideoXAttnProcessor2_0_resample:
             raise ValueError("resample_mask must not be None")
 
         query_org = attn.to_q(hidden_cat)
-        key_org   = attn.to_k(hidden_cat)
+        key_org = attn.to_k(hidden_cat)
         value_org = attn.to_v(hidden_cat)
 
         if prev_hidden_states is not None and prev_clip_weight is not None and prev_clip_weight > 0.0:
-            prev_key   = attn.to_k(prev_hidden_states)
+            prev_key = attn.to_k(prev_hidden_states)
             prev_value = attn.to_v(prev_hidden_states)
-            key_mask   = prev_key   * prev_resample_mask.unsqueeze(-1) * prev_clip_weight
+            key_mask = prev_key * prev_resample_mask.unsqueeze(-1) * prev_clip_weight
             value_mask = prev_value * prev_resample_mask.unsqueeze(-1) * prev_clip_weight
         else:
-            key_mask   = key_org   * resample_mask.unsqueeze(-1)
+            key_mask = key_org * resample_mask.unsqueeze(-1)
             value_mask = value_org * resample_mask.unsqueeze(-1)
 
         inner_dim = key_org.shape[-1]
-        head_dim  = inner_dim // attn.heads
+        head_dim = inner_dim // attn.heads
         B = hidden_states.shape[0]
 
         query_org = query_org.view(B, -1, attn.heads, head_dim).transpose(1, 2)
-        key_org   = key_org.view(B, -1, attn.heads, head_dim).transpose(1, 2)
+        key_org = key_org.view(B, -1, attn.heads, head_dim).transpose(1, 2)
         value_org = value_org.view(B, -1, attn.heads, head_dim).transpose(1, 2)
-        key_mask  = key_mask.view(B, -1, attn.heads, head_dim).transpose(1, 2)
-        value_mask= value_mask.view(B, -1, attn.heads, head_dim).transpose(1, 2)
+        key_mask = key_mask.view(B, -1, attn.heads, head_dim).transpose(1, 2)
+        value_mask = value_mask.view(B, -1, attn.heads, head_dim).transpose(1, 2)
 
         if attn.norm_q is not None:
             query_org = attn.norm_q(query_org)
         if attn.norm_k is not None:
-            key_org   = attn.norm_k(key_org)
-            key_mask  = attn.norm_k(key_mask)
+            key_org = attn.norm_k(key_org)
+            key_mask = attn.norm_k(key_mask)
 
         if image_rotary_emb is not None:
             from .embeddings import apply_rotary_emb
             query_org[:, :, text_seq_length:] = apply_rotary_emb(query_org[:, :, text_seq_length:], image_rotary_emb)
             if not attn.is_cross_attention:
-                key_org[:, :, text_seq_length:]  = apply_rotary_emb(key_org[:, :, text_seq_length:], image_rotary_emb)
+                key_org[:, :, text_seq_length:] = apply_rotary_emb(key_org[:, :, text_seq_length:], image_rotary_emb)
                 key_mask[:, :, text_seq_length:] = apply_rotary_emb(key_mask[:, :, text_seq_length:], image_rotary_emb)
 
-        key_org   = torch.cat([key_org,   key_mask],   dim=-2)
+
+
+        key_org = torch.cat([key_org, key_mask], dim=-2)
         value_org = torch.cat([value_org, value_mask], dim=-2)
 
-        if (focus_ids is not None)  and (strength is not None):
-            use_density_branch = (
-                do_density_edit and (alpha_tok is not None) and (focus_ids is not None) and (focus_ids.numel() > 0)
-            )
-            scale_by_depth = 1.0
+        def _expand_for_batch(x_tok: torch.Tensor, B: int, V: int, dtype, device):
+            if x_tok is None:
+                return None
+            x = x_tok
+            if x.dim() == 2:
+                x = x.unsqueeze(1).unsqueeze(-1)
+            elif x.dim() == 3:
+                x = x.unsqueeze(-1)
+            x = x.to(device=device, dtype=torch.float32)
+            B0 = x.shape[0]
+            if B0 == B:
+                return x
+            if (B % 2 == 0) and (B0 == 1):
+                zeros = torch.zeros((B // 2, 1, V, 1), device=device, dtype=x.dtype)
+                cond = x.expand(B // 2, -1, -1, -1)
+                return torch.cat([zeros, cond], dim=0)
+            if (B % 2 == 0) and (B0 == B // 2):
+                zeros = torch.zeros_like(x)
+                return torch.cat([zeros, x], dim=0)
+            return x.expand(B, -1, -1, -1)
 
-            if attn_layer_index is not None and attn_num_layers is not None:
-                t = attn_layer_index / max(1, attn_num_layers - 1)
-                scale_by_depth = 0.8 + 0.4 * t
-            strength = float(strength) * scale_by_depth
-            print(f"[AttnEdit] strength with layer={strength}")
-            print(f"[AttnEdit] layer={attn_layer_index}")
+        if (focus_ids is not None) and (strength is not None):
+            use_density_branch = (
+                    do_density_edit and (alpha_tok is not None) and (focus_ids.numel() > 0)
+            )
 
             if use_density_branch:
                 T = text_seq_length
@@ -2357,24 +2369,23 @@ class CogVideoXAttnProcessor2_0_resample:
 
                 fids = focus_ids.clamp(0, T - 1)
 
-                if alpha_tok.dim() == 2:
-                    alpha = alpha_tok.unsqueeze(1).unsqueeze(-1)
-                elif alpha_tok.dim() == 3:
-                    alpha = alpha_tok.unsqueeze(-1)
-                else:
-                    alpha = alpha_tok
-
+                alpha = _expand_for_batch(alpha_tok, qv.shape[0], V, qv.dtype, qv.device)
                 if editable_mask is not None:
-                    m = editable_mask
-                    if m.dim() == 2:
-                        m = m.unsqueeze(1).unsqueeze(-1)
+                    m = _expand_for_batch(editable_mask, qv.shape[0], V, qv.dtype, qv.device)
                     m = (m > 0).to(qv.dtype)
                 else:
-                    m = torch.ones((B, 1, V, 1), dtype=qv.dtype, device=qv.device)
+                    m = torch.ones((qv.shape[0], 1, V, 1), dtype=qv.dtype, device=qv.device)
 
-                denom_c = max(center_c, 1.0 - center_c) + 1e-6
-                g = torch.sign(alpha - center_c) * torch.pow((alpha - center_c).abs() / denom_c, gamma)
-                g = (g * m).to(qv.dtype)
+                nz = alpha[alpha > 0]
+                if nz.numel() > 16:
+                    q50 = torch.quantile(nz, 0.50)
+                    spread = torch.quantile(nz, 0.90) - torch.quantile(nz, 0.10)
+                    spread = torch.clamp(spread, min=1e-3)
+                    delta = (alpha - q50) / spread
+                else:
+                    delta = alpha - 0.5
+                g = torch.tanh(float(gamma) * delta) * m
+                g = g.to(qv.dtype)
 
                 logits_full = torch.matmul(qv, k_text.transpose(-2, -1)) / math.sqrt(head_dim)
                 p_full_base = torch.softmax(logits_full, dim=-1)
@@ -2382,15 +2393,11 @@ class CogVideoXAttnProcessor2_0_resample:
                 mask_t = torch.zeros((1, 1, 1, T), dtype=logits_full.dtype, device=logits_full.device)
                 mask_t[..., fids] = 1.0
 
-                g_pos = torch.clamp(g, min=0.0)
-                g_neg = -torch.clamp(g, max=0.0)
-                kappa_pos = 1.5 * float(kappa)
-                kappa_neg = 0.9 * float(kappa)
+                bias_focus = float(kappa) * g * mask_t
+                if beta_s > 0.0:
+                    bias_focus = bias_focus - float(beta_s) * bias_focus.mean(dim=-1, keepdim=True)
 
-                bias_focus = (kappa_pos * g_pos - kappa_neg * g_neg) * mask_t
-                bias_balanced = bias_focus - bias_focus.mean(dim=-1, keepdim=True)
-
-                p_full_edit = torch.softmax(logits_full + bias_balanced, dim=-1)
+                p_full_edit = torch.softmax(logits_full + bias_focus, dim=-1)
                 delta_p_full = p_full_edit - p_full_base
                 delta_y = torch.matmul(delta_p_full, v_text)
 
@@ -2398,30 +2405,26 @@ class CogVideoXAttnProcessor2_0_resample:
                     query_org, key_org, value_org, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
                 )
 
-                H = qv.shape[1]
-                w = torch.ones((H,), dtype=delta_y.dtype, device=delta_y.device)
-                cut = H // 3
-                w[:cut] = 0.7
-                delta_y = delta_y * w.view(1, H, 1, 1)
-
                 ref = hidden_raw[:, :, T:, :].detach()
                 ref_norm = ref.norm(dim=-1, keepdim=True) + 1e-6
-                delta_y = delta_y.clamp(min=-4 * ref_norm, max=6 * ref_norm)
+                ref_std = ref.std(dim=(-2, -1), keepdim=True) + 1e-6
+                c = 6.0 * ref_std + 0.5 * ref_norm
+                delta_y = torch.clamp(delta_y, min=-c, max=c)
 
                 hidden_raw[:, :, T:, :] = hidden_raw[:, :, T:, :] + float(strength) * delta_y
 
-                out = hidden_raw.transpose(1, 2).reshape(B, -1, attn.heads * head_dim)
+                out = hidden_raw.transpose(1, 2).reshape(qv.shape[0], -1, attn.heads * head_dim)
                 out = attn.to_out[0](out)
                 out = attn.to_out[1](out)
 
                 encoder_out, video_out = out.split([text_seq_length, out.size(1) - text_seq_length], dim=1)
                 return video_out, encoder_out
 
+        # ---- 无编辑路径 ----
         hidden = F.scaled_dot_product_attention(
             query_org, key_org, value_org, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
-
-        hidden = hidden.transpose(1, 2).reshape(B, -1, attn.heads * head_dim)
+        hidden = hidden.transpose(1, 2).reshape(B, -1, attn.heads * (query_org.shape[-1]))
         hidden = attn.to_out[0](hidden)
         hidden = attn.to_out[1](hidden)
 
@@ -2429,8 +2432,6 @@ class CogVideoXAttnProcessor2_0_resample:
             [text_seq_length, hidden.size(1) - text_seq_length], dim=1
         )
         return hidden_states, encoder_hidden_states
-
-
 
 
 class CogVideoXAttnProcessor2_0_wo_text:
